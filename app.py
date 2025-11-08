@@ -16,6 +16,21 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 
+# Check and install watchdog if needed (required for Streamlit file watching)
+try:
+    import watchdog
+except ImportError:
+    import subprocess
+    import sys
+    try:
+        # Try to install watchdog silently
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "watchdog>=3.0.0"], 
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import watchdog
+    except Exception as e:
+        # If installation fails, continue anyway (watchdog is optional for basic functionality)
+        pass
+
 # Page configuration
 st.set_page_config(
     page_title="Whisper Speech Transcription",
@@ -49,7 +64,8 @@ def save_transcription(transcription_data):
 # Configuration for large file processing
 CHUNK_SIZE_MB = 200  # Maximum chunk size in MB
 MAX_WORKERS = 5  # Number of parallel threads
-CHUNK_DURATION_SECONDS = 600  # 10 minutes per chunk (adjust based on file size)
+CHUNK_DURATION_SECONDS = 300  # 5 minutes per chunk (reduced to create more chunks for better parallelization)
+MIN_CHUNK_DURATION_SECONDS = 60  # Minimum chunk duration (1 minute) to avoid too many tiny chunks
 
 def get_file_duration(file_path):
     """Get the duration of an audio/video file in seconds using ffprobe"""
@@ -88,8 +104,41 @@ def get_file_duration(file_path):
             pass
         return None
 
-def split_file_into_chunks(file_path, chunk_duration=CHUNK_DURATION_SECONDS):
-    """Split a large file into time-based chunks using ffmpeg"""
+def validate_chunk_file(chunk_path, min_duration=1.0):
+    """Validate that a chunk file has audio content"""
+    try:
+        # Check file exists and has content
+        if not os.path.exists(chunk_path):
+            return False
+        
+        file_size = os.path.getsize(chunk_path)
+        # Minimum file size: at least 1KB (roughly 0.1 seconds of audio)
+        if file_size < 1024:
+            return False
+        
+        # Check actual duration using ffprobe
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            chunk_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        chunk_duration = float(result.stdout.strip())
+        
+        # Chunk must have at least min_duration seconds of audio
+        return chunk_duration >= min_duration
+    except:
+        return False
+
+def split_file_into_chunks(file_path, chunk_duration=CHUNK_DURATION_SECONDS, max_workers=MAX_WORKERS):
+    """Split a large file into time-based chunks using ffmpeg
+    
+    Creates enough chunks to utilize the thread pool effectively.
+    Adjusts chunk size to ensure we have at least max_workers chunks
+    (or close to it) for better parallelization.
+    """
     duration = get_file_duration(file_path)
     if duration is None:
         # Fallback: estimate based on file size (rough estimate)
@@ -99,44 +148,138 @@ def split_file_into_chunks(file_path, chunk_duration=CHUNK_DURATION_SECONDS):
     
     chunks = []
     chunk_dir = tempfile.mkdtemp()
-    num_chunks = int(duration / chunk_duration) + 1
+    
+    # Calculate optimal chunk duration to utilize thread pool
+    # We want at least max_workers chunks, but not too many tiny chunks
+    initial_num_chunks = int(duration / chunk_duration) + 1
+    
+    # If we have fewer chunks than workers, reduce chunk duration to create more chunks
+    if initial_num_chunks < max_workers:
+        # Adjust chunk duration to create approximately max_workers chunks
+        # But don't go below MIN_CHUNK_DURATION_SECONDS
+        optimal_chunk_duration = max(
+            MIN_CHUNK_DURATION_SECONDS,
+            duration / max_workers
+        )
+        chunk_duration = optimal_chunk_duration
+        num_chunks = int(duration / chunk_duration) + 1
+    else:
+        num_chunks = initial_num_chunks
+    
+    # Ensure we don't create chunks that are too short
+    if duration < MIN_CHUNK_DURATION_SECONDS:
+        # File is very short, process as single chunk
+        num_chunks = 1
+        chunk_duration = duration
     
     for i in range(num_chunks):
         start_time = i * chunk_duration
         end_time = min((i + 1) * chunk_duration, duration)
+        chunk_length = end_time - start_time
+        
+        # Skip chunks that are too short (less than 2 seconds)
+        # This prevents empty or near-empty chunks that cause tensor errors
+        if chunk_length < 2.0:
+            # If this is the last chunk and it's short, merge it with the previous one
+            if i == num_chunks - 1 and chunks:
+                # Extend the last chunk to include this short segment
+                last_chunk = chunks[-1]
+                last_chunk["end_time"] = duration
+                last_chunk["duration"] = duration - last_chunk["start_time"]
+            continue
         
         chunk_path = os.path.join(chunk_dir, f"chunk_{i:04d}.wav")
         
-        # Extract chunk using ffmpeg
+        # Extract chunk using ffmpeg with better error handling
         cmd = [
             "ffmpeg",
             "-i", file_path,
             "-ss", str(start_time),
-            "-t", str(end_time - start_time),
+            "-t", str(chunk_length),
             "-acodec", "pcm_s16le",
             "-ar", "16000",
             "-ac", "1",
+            "-avoid_negative_ts", "make_zero",  # Handle timestamp issues
             "-y",  # Overwrite output file
             chunk_path
         ]
         
         try:
-            subprocess.run(cmd, capture_output=True, check=True)
-            chunks.append({
-                "path": chunk_path,
-                "index": i,
-                "start_time": start_time,
-                "end_time": end_time
-            })
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            # Validate the chunk file
+            if validate_chunk_file(chunk_path, min_duration=1.0):
+                chunks.append({
+                    "path": chunk_path,
+                    "index": i,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration": chunk_length
+                })
+            else:
+                # Chunk is empty or too short, skip it
+                try:
+                    os.remove(chunk_path)
+                except:
+                    pass
+                continue
+                
         except subprocess.CalledProcessError as e:
-            st.warning(f"Failed to create chunk {i}: {e}")
+            # Log the error but continue
+            error_msg = e.stderr.decode() if e.stderr else str(e)
+            if "Output file does not contain any stream" not in error_msg:
+                # Only warn if it's not an expected empty chunk
+                pass
+            try:
+                if os.path.exists(chunk_path):
+                    os.remove(chunk_path)
+            except:
+                pass
             continue
     
     return chunks, chunk_dir
 
 def transcribe_chunk(chunk_info, model, transcribe_options, progress_callback=None):
-    """Transcribe a single chunk"""
+    """Transcribe a single chunk with validation"""
     try:
+        # Validate chunk file before processing
+        if not os.path.exists(chunk_info["path"]):
+            return {
+                "chunk_index": chunk_info["index"],
+                "start_time": chunk_info["start_time"],
+                "error": "Chunk file does not exist",
+                "success": False
+            }
+        
+        file_size = os.path.getsize(chunk_info["path"])
+        if file_size < 1024:  # Less than 1KB
+            return {
+                "chunk_index": chunk_info["index"],
+                "start_time": chunk_info["start_time"],
+                "error": "Chunk file is too small (likely empty)",
+                "success": False
+            }
+        
+        # Try to load audio first to validate it's not empty
+        try:
+            import whisper
+            audio = whisper.load_audio(chunk_info["path"])
+            if len(audio) == 0 or audio.size == 0:
+                return {
+                    "chunk_index": chunk_info["index"],
+                    "start_time": chunk_info["start_time"],
+                    "error": "Chunk contains no audio data",
+                    "success": False
+                }
+        except Exception as e:
+            return {
+                "chunk_index": chunk_info["index"],
+                "start_time": chunk_info["start_time"],
+                "error": f"Failed to load audio: {str(e)}",
+                "success": False
+            }
+        
+        # Transcribe the chunk
         result = model.transcribe(chunk_info["path"], **transcribe_options)
         
         # Adjust timestamps to account for chunk offset
@@ -156,14 +299,18 @@ def transcribe_chunk(chunk_info, model, transcribe_options, progress_callback=No
             "success": True
         }
     except Exception as e:
+        error_msg = str(e)
+        # Provide more helpful error messages
+        if "reshape" in error_msg and "0 elements" in error_msg:
+            error_msg = "Chunk contains no audio data or is empty"
         return {
             "chunk_index": chunk_info["index"],
             "start_time": chunk_info["start_time"],
-            "error": str(e),
+            "error": error_msg,
             "success": False
         }
 
-def combine_chunk_results(chunk_results):
+def combine_chunk_results(chunk_results, chunks_info):
     """Combine transcription results from multiple chunks, maintaining temporal order"""
     # Sort by chunk index to maintain order
     chunk_results.sort(key=lambda x: x["chunk_index"])
@@ -172,40 +319,76 @@ def combine_chunk_results(chunk_results):
     all_text_parts = []
     language = None
     total_duration = 0
+    processed_chunk_indices = set()
+    
+    # Create a map of chunk indices to their time ranges
+    chunk_time_map = {chunk["index"]: (chunk["start_time"], chunk["end_time"]) for chunk in chunks_info}
     
     for chunk_result in chunk_results:
         if not chunk_result["success"]:
+            # Track which chunks were skipped
+            chunk_idx = chunk_result["chunk_index"]
+            processed_chunk_indices.add(chunk_idx)
             continue
+        
+        chunk_idx = chunk_result["chunk_index"]
+        processed_chunk_indices.add(chunk_idx)
         
         result = chunk_result["result"]
         
         if language is None:
             language = result.get("language")
         
-        # Collect segments
+        # Collect segments with proper timestamp adjustment
         if result.get("segments"):
-            all_segments.extend(result["segments"])
+            for segment in result["segments"]:
+                # Ensure timestamps are within chunk bounds
+                chunk_start = chunk_result["start_time"]
+                segment_start = segment.get("start", 0)
+                segment_end = segment.get("end", 0)
+                
+                # Validate timestamps are reasonable
+                if segment_start >= 0 and segment_end > segment_start:
+                    all_segments.append(segment)
         
-        # Collect text
+        # Collect text - preserve spacing between chunks
         text = result.get("text", "").strip()
         if text:
             all_text_parts.append(text)
         
-        # Update total duration
-        total_duration = max(total_duration, result.get("duration", 0) + chunk_result["start_time"])
+        # Update total duration based on chunk end time
+        chunk_start = chunk_result["start_time"]
+        chunk_duration = result.get("duration", 0)
+        chunk_end_time = chunk_start + chunk_duration
+        total_duration = max(total_duration, chunk_end_time)
     
-    # Combine text
-    combined_text = " ".join(all_text_parts)
+    # Check for missing chunks
+    expected_indices = set(range(len(chunks_info)))
+    missing_indices = expected_indices - processed_chunk_indices
     
-    # Sort segments by start time
+    # Sort segments by start time to ensure temporal order
     all_segments.sort(key=lambda x: x.get("start", 0))
     
-    return {
+    # Combine text with proper spacing
+    combined_text = " ".join(all_text_parts)
+    
+    # Build full result with all metadata
+    combined_result = {
         "text": combined_text,
         "segments": all_segments,
         "language": language,
         "duration": total_duration
     }
+    
+    # Add metadata about chunk processing
+    if missing_indices:
+        combined_result["_metadata"] = {
+            "missing_chunks": sorted(list(missing_indices)),
+            "processed_chunks": sorted(list(processed_chunk_indices)),
+            "total_chunks": len(chunks_info)
+        }
+    
+    return combined_result
 
 def create_docx(transcription_text, filename, metadata=None, segments=None):
     """Create a DOCX file from transcription text with timestamps"""
@@ -385,45 +568,277 @@ with tab1:
                         transcription_status.info(f"📦 File is {file_size_mb:.2f} MB. Splitting into chunks for parallel processing...")
                         
                         # Split file into chunks
-                        chunks, chunk_dir = split_file_into_chunks(tmp_file_path)
+                        chunks, chunk_dir = split_file_into_chunks(tmp_file_path, max_workers=MAX_WORKERS)
                         num_chunks = len(chunks)
                         
-                        transcription_progress.progress(10, text=f"Created {num_chunks} chunks. Starting parallel transcription...")
-                        transcription_status.info(f"🔄 Processing {num_chunks} chunks in parallel using {MAX_WORKERS} threads...")
+                        if num_chunks == 0:
+                            raise ValueError("Failed to create valid chunks from the file. The file may be corrupted or contain no audio.")
+                        
+                        # Calculate actual thread usage (min of workers and chunks)
+                        actual_threads = min(MAX_WORKERS, num_chunks)
+                        
+                        transcription_progress.progress(10, text=f"Created {num_chunks} valid chunks. Starting parallel transcription...")
+                        transcription_status.info(f"🔄 Processing {num_chunks} chunks in parallel using {actual_threads} threads (pool size: {MAX_WORKERS})...")
+                        
+                        # Show chunk coverage info
+                        if chunks:
+                            total_chunk_duration = sum(chunk.get("duration", 0) for chunk in chunks)
+                            file_duration = get_file_duration(tmp_file_path)
+                            if file_duration:
+                                coverage_pct = (total_chunk_duration / file_duration) * 100
+                                st.info(f"📊 Chunk coverage: {total_chunk_duration:.1f}s / {file_duration:.1f}s ({coverage_pct:.1f}%) - All chunks will be processed and reconstituted")
+                        
+                        # Create individual progress indicators for each chunk
+                        chunk_progress_container = st.container()
+                        with chunk_progress_container:
+                            st.subheader("📊 Individual Chunk Progress")
+                            chunk_progress_bars = {}
+                            chunk_status_texts = {}
+                            
+                            # Initialize progress bars for each chunk
+                            for chunk in chunks:
+                                chunk_idx = chunk["index"]
+                                chunk_key = f"chunk_{chunk_idx}"
+                                
+                                col1, col2 = st.columns([1, 4])
+                                with col1:
+                                    st.write(f"**Chunk {chunk_idx + 1}**")
+                                    st.caption(f"{chunk['start_time']:.1f}s - {chunk['end_time']:.1f}s")
+                                
+                                with col2:
+                                    chunk_progress_bars[chunk_key] = st.progress(0, text="Waiting to start...")
+                                    chunk_status_texts[chunk_key] = st.empty()
+                                    chunk_status_texts[chunk_key].info("⏳ Queued for processing...")
                         
                         # Process chunks in parallel
                         chunk_results = []
                         completed_chunks = 0
+                        successful_chunks = 0
+                        failed_chunks = []
+                        
+                        # Thread-safe progress tracking and model access
+                        progress_lock = threading.Lock()
+                        model_lock = threading.Lock()  # Lock for model access (Whisper models are not thread-safe)
+                        progress_updates = {}  # Store progress updates to apply in main thread
+                        
+                        def update_chunk_progress(chunk_idx, status, progress_pct=0):
+                            """Update progress for a specific chunk (thread-safe)"""
+                            chunk_key = f"chunk_{chunk_idx}"
+                            with progress_lock:
+                                progress_updates[chunk_key] = {
+                                    "status": status,
+                                    "progress": progress_pct,
+                                    "message": f"🔄 {status}"
+                                }
+                        
+                        def transcribe_chunk_with_progress(chunk_info, model, transcribe_options):
+                            """Transcribe chunk with progress updates"""
+                            chunk_idx = chunk_info["index"]
+                            chunk_key = f"chunk_{chunk_idx}"
+                            
+                            try:
+                                update_chunk_progress(chunk_idx, "Starting transcription...", 10)
+                                
+                                # Validate chunk first
+                                if not os.path.exists(chunk_info["path"]):
+                                    update_chunk_progress(chunk_idx, "❌ File not found", 0)
+                                    return {
+                                        "chunk_index": chunk_idx,
+                                        "start_time": chunk_info["start_time"],
+                                        "error": "Chunk file does not exist",
+                                        "success": False
+                                    }
+                                
+                                file_size = os.path.getsize(chunk_info["path"])
+                                if file_size < 1024:
+                                    update_chunk_progress(chunk_idx, "❌ Empty chunk", 0)
+                                    return {
+                                        "chunk_index": chunk_idx,
+                                        "start_time": chunk_info["start_time"],
+                                        "error": "Chunk file is too small (likely empty)",
+                                        "success": False
+                                    }
+                                
+                                update_chunk_progress(chunk_idx, "Loading audio...", 20)
+                                
+                                # Load and validate audio
+                                try:
+                                    audio = whisper.load_audio(chunk_info["path"])
+                                    if len(audio) == 0 or audio.size == 0:
+                                        update_chunk_progress(chunk_idx, "❌ No audio data", 0)
+                                        return {
+                                            "chunk_index": chunk_idx,
+                                            "start_time": chunk_info["start_time"],
+                                            "error": "Chunk contains no audio data",
+                                            "success": False
+                                        }
+                                except Exception as e:
+                                    update_chunk_progress(chunk_idx, f"❌ Audio load failed: {str(e)[:50]}", 0)
+                                    return {
+                                        "chunk_index": chunk_idx,
+                                        "start_time": chunk_info["start_time"],
+                                        "error": f"Failed to load audio: {str(e)}",
+                                        "success": False
+                                    }
+                                
+                                update_chunk_progress(chunk_idx, "Transcribing...", 40)
+                                
+                                # Transcribe with progress tracking and better error handling
+                                # Use model lock to ensure thread-safe access (Whisper models are not thread-safe)
+                                try:
+                                    with model_lock:
+                                        result = model.transcribe(chunk_info["path"], **transcribe_options)
+                                except Exception as transcribe_error:
+                                    # Catch transcription errors and provide better error messages
+                                    error_msg = str(transcribe_error)
+                                    # Filter out model internals from error messages
+                                    if "Linear(" in error_msg or "in_features" in error_msg:
+                                        error_msg = "Model error during transcription (possibly corrupted audio or model issue)"
+                                    elif "CUDA" in error_msg or "cuda" in error_msg:
+                                        error_msg = "GPU/CUDA error during transcription"
+                                    elif "out of memory" in error_msg.lower():
+                                        error_msg = "Out of memory during transcription"
+                                    else:
+                                        # Keep original error but truncate if too long
+                                        error_msg = error_msg[:200] if len(error_msg) > 200 else error_msg
+                                    
+                                    update_chunk_progress(chunk_idx, f"❌ Transcription failed", 0)
+                                    return {
+                                        "chunk_index": chunk_idx,
+                                        "start_time": chunk_info["start_time"],
+                                        "error": error_msg,
+                                        "success": False
+                                    }
+                                
+                                update_chunk_progress(chunk_idx, "Processing segments...", 80)
+                                
+                                # Adjust timestamps to account for chunk offset
+                                if result.get("segments"):
+                                    for segment in result["segments"]:
+                                        segment["start"] += chunk_info["start_time"]
+                                        segment["end"] += chunk_info["start_time"]
+                                        if segment.get("words"):
+                                            for word in segment["words"]:
+                                                word["start"] += chunk_info["start_time"]
+                                                word["end"] += chunk_info["start_time"]
+                                
+                                num_segments = len(result.get('segments', []))
+                                update_chunk_progress(chunk_idx, f"✅ Complete ({num_segments} segments)", 100)
+                                
+                                return {
+                                    "chunk_index": chunk_idx,
+                                    "start_time": chunk_info["start_time"],
+                                    "result": result,
+                                    "success": True,
+                                    "num_segments": num_segments
+                                }
+                            except Exception as e:
+                                error_msg = str(e)
+                                if "reshape" in error_msg and "0 elements" in error_msg:
+                                    error_msg = "Chunk contains no audio data or is empty"
+                                update_chunk_progress(chunk_idx, f"❌ Error: {error_msg[:50]}", 0)
+                                return {
+                                    "chunk_index": chunk_idx,
+                                    "start_time": chunk_info["start_time"],
+                                    "error": error_msg,
+                                    "success": False
+                                }
                         
                         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                            # Submit all chunks
+                            # Submit all chunks with progress tracking
                             future_to_chunk = {
-                                executor.submit(transcribe_chunk, chunk, model, transcribe_options): chunk
+                                executor.submit(transcribe_chunk_with_progress, chunk, model, transcribe_options): chunk
                                 for chunk in chunks
                             }
                             
-                            # Process completed chunks as they finish
+                            # Process completed chunks as they finish and update UI
                             for future in as_completed(future_to_chunk):
+                                # Apply any pending progress updates
+                                with progress_lock:
+                                    for chunk_key, update_info in progress_updates.items():
+                                        if chunk_key in chunk_progress_bars:
+                                            chunk_progress_bars[chunk_key].progress(
+                                                update_info["progress"] / 100, 
+                                                text=update_info["status"]
+                                            )
+                                            chunk_status_texts[chunk_key].info(update_info["message"])
+                                    progress_updates.clear()
+                                
                                 chunk_result = future.result()
                                 chunk_results.append(chunk_result)
                                 completed_chunks += 1
                                 
-                                # Update progress
+                                chunk_idx = chunk_result["chunk_index"]
+                                chunk_key = f"chunk_{chunk_idx}"
+                                
+                                if chunk_result["success"]:
+                                    successful_chunks += 1
+                                    num_segments = chunk_result.get("num_segments", 0)
+                                    chunk_progress_bars[chunk_key].progress(100, text=f"✅ Complete ({num_segments} segments)")
+                                    chunk_status_texts[chunk_key].success(f"✅ Completed: {num_segments} segments")
+                                    st.toast(f"✅ Chunk {chunk_idx + 1}/{num_chunks} completed", icon="✅")
+                                else:
+                                    failed_chunks.append({
+                                        "index": chunk_idx + 1,
+                                        "error": chunk_result.get('error', 'Unknown error')
+                                    })
+                                    chunk_progress_bars[chunk_key].progress(0, text=f"❌ Failed")
+                                    chunk_status_texts[chunk_key].error(f"❌ Failed: {chunk_result.get('error', 'Unknown error')[:100]}")
+                                    # Don't show warning for empty chunks (expected for silent segments)
+                                    if "empty" not in chunk_result.get('error', '').lower() and "no audio" not in chunk_result.get('error', '').lower():
+                                        st.warning(f"⚠️ Chunk {chunk_idx + 1} skipped: {chunk_result.get('error', 'Unknown error')}")
+                                
+                                # Update overall progress
                                 progress_pct = 10 + int((completed_chunks / num_chunks) * 85)
                                 transcription_progress.progress(
                                     progress_pct / 100,
-                                    text=f"Processing chunks... {completed_chunks}/{num_chunks} completed"
+                                    text=f"Processing chunks... {completed_chunks}/{num_chunks} completed ({successful_chunks} successful)"
                                 )
-                                
-                                if chunk_result["success"]:
-                                    st.toast(f"✅ Chunk {chunk_result['chunk_index'] + 1}/{num_chunks} completed", icon="✅")
-                                else:
-                                    st.warning(f"⚠️ Chunk {chunk_result['chunk_index'] + 1} failed: {chunk_result.get('error', 'Unknown error')}")
+                        
+                        # Check if we have any successful chunks
+                        if successful_chunks == 0:
+                            raise ValueError(f"All {num_chunks} chunks failed to transcribe. Please check the file format and try again.")
+                        
+                        # Calculate success rate
+                        success_rate = (successful_chunks / num_chunks) * 100
+                        
+                        # Show summary of failed chunks if any
+                        if failed_chunks:
+                            failed_summary = "\n".join([f"  - Chunk {f['index']}: {f['error']}" for f in failed_chunks])
+                            
+                            # Determine severity based on success rate
+                            if success_rate < 50:
+                                # Less than 50% success - this is a problem
+                                transcription_status.error(f"❌ **WARNING**: Only {successful_chunks}/{num_chunks} chunks succeeded ({success_rate:.1f}% success rate). Transcription may be incomplete!\n\n**Failed chunks:**\n{failed_summary}\n\n**Recommendation**: Check the file for corruption or try a different model size.")
+                            elif success_rate < 80:
+                                # 50-80% success - partial success
+                                transcription_status.warning(f"⚠️ **Partial Success**: {successful_chunks}/{num_chunks} chunks succeeded ({success_rate:.1f}% success rate). Some content may be missing.\n\n**Failed chunks:**\n{failed_summary}\n\nContinuing with {successful_chunks} successful chunk(s)...")
+                            else:
+                                # 80%+ success - mostly successful
+                                transcription_status.warning(f"⚠️ {len(failed_chunks)} chunk(s) failed:\n{failed_summary}\n\nContinuing with {successful_chunks} successful chunk(s)...")
                         
                         # Combine results
                         transcription_progress.progress(95, text="Combining results...")
-                        transcription_status.info("🔗 Combining transcription results from all chunks...")
-                        result = combine_chunk_results(chunk_results)
+                        transcription_status.info(f"🔗 Combining transcription results from {successful_chunks} successful chunk(s)...")
+                        result = combine_chunk_results(chunk_results, chunks)
+                        
+                        # Verify completeness
+                        if result.get("_metadata"):
+                            missing = result["_metadata"].get("missing_chunks", [])
+                            if missing:
+                                st.warning(f"⚠️ Note: {len(missing)} chunk(s) were skipped: {missing}")
+                        
+                        # Show summary with success rate
+                        total_segments = len(result.get("segments", []))
+                        total_text_length = len(result.get("text", ""))
+                        
+                        # Determine final status based on success rate
+                        if success_rate >= 80:
+                            transcription_status.success(f"✅ **Transcription completed!** {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters")
+                        elif success_rate >= 50:
+                            transcription_status.warning(f"⚠️ **Partial transcription completed.** {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters. Some content may be missing.")
+                        else:
+                            transcription_status.error(f"❌ **Incomplete transcription.** Only {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters. Significant content may be missing.")
                         
                         # Clean up chunk files
                         import shutil
@@ -433,8 +848,14 @@ with tab1:
                             pass
                         
                         transcription_progress.progress(100, text="Transcription complete!")
-                        transcription_status.success(f"✅ Transcription completed! Processed {num_chunks} chunks with {len(result.get('segments', []))} total segments.")
-                        st.toast("✅ All chunks processed and combined!", icon="✅")
+                        
+                        # Final toast message based on success rate
+                        if success_rate >= 80:
+                            st.toast("✅ Transcription completed successfully!", icon="✅")
+                        elif success_rate >= 50:
+                            st.toast("⚠️ Partial transcription completed - some chunks failed", icon="⚠️")
+                        else:
+                            st.toast("❌ Incomplete transcription - many chunks failed", icon="❌")
                 else:
                     # Small file: Use standard processing
                     with progress_container:
@@ -522,7 +943,8 @@ with tab1:
                     "Transcribed Text",
                     value=result["text"],
                     height=200,
-                    label_visibility="collapsed"
+                    label_visibility="collapsed",
+                    key="main_transcription_text_area"
                 )
                 
                 # Additional information
@@ -728,12 +1150,14 @@ with tab2:
                     
                     # Preview text
                     text_preview = trans.get('text', '')[:500]  # First 500 chars
+                    trans_id = trans.get('id', 'unknown')
                     st.text_area(
                         "Preview",
                         value=text_preview + ("..." if len(trans.get('text', '')) > 500 else ""),
                         height=100,
                         disabled=True,
-                        label_visibility="collapsed"
+                        label_visibility="collapsed",
+                        key=f"preview_text_area_{trans_id}"
                     )
                     
                     # Download buttons

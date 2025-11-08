@@ -25,6 +25,10 @@ fi
 echo "📦 Activating virtual environment..."
 source venv/bin/activate
 
+# Install/update app dependencies
+echo "📦 Installing/updating app dependencies..."
+pip install -q watchdog>=3.0.0 streamlit>=1.28.0 python-docx>=1.0.0 2>/dev/null || echo "Dependencies already installed"
+
 # Verify config file exists
 if [ -f ".streamlit/config.toml" ]; then
     echo "✅ Config file found: .streamlit/config.toml"
