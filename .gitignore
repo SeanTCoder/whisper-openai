@@ -1,11 +1,79 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info
-.pytest_cache
-.ipynb_checkpoints
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
 
-thumbs.db
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 .DS_Store
-.idea
+thumbs.db
+
+# Streamlit
+.streamlit/credentials.toml
+.streamlit/secrets.toml
+streamlit.log
+streamlit_output.log
+*.log
+
+# Application specific
+# User transcriptions - exclude user data (keep structure but not content)
+transcriptions/*.json
+!transcriptions/.gitkeep
+
+# Test output files
+jfk.json
+jfk.srt
+jfk.tsv
+jfk.txt
+jfk.vtt
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+.cache/
+
+# Model cache (if stored locally)
+# Uncomment if you want to exclude downloaded Whisper models
+# ~/.cache/whisper/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Package files
+*.egg-info/
+openai_whisper.egg-info/
 

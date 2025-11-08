@@ -1,7 +1,11 @@
 [server]
 maxUploadSize = 2000
 maxMessageSize = 2000
+fileWatcherType = "auto"
+headless = true
 
-[server.fileWatcherType]
-auto = true
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+serverPort = 8501
 
