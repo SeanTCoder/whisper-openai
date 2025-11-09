@@ -42,6 +42,7 @@ st.set_page_config(
 STORAGE_DIR = Path("transcriptions")
 STORAGE_DIR.mkdir(exist_ok=True)
 TRANSCRIPTIONS_FILE = STORAGE_DIR / "transcriptions.json"
+ARCHIVED_TRANSCRIPTIONS_FILE = STORAGE_DIR / "archived_transcriptions.json"
 
 # Helper functions for storage
 def load_transcriptions():
@@ -60,6 +61,60 @@ def save_transcription(transcription_data):
     transcriptions.append(transcription_data)
     with open(TRANSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
         json.dump(transcriptions, f, indent=2, ensure_ascii=False)
+
+def load_archived_transcriptions():
+    """Load archived transcriptions from JSON file"""
+    if ARCHIVED_TRANSCRIPTIONS_FILE.exists():
+        try:
+            with open(ARCHIVED_TRANSCRIPTIONS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def archive_transcription(transcription_id):
+    """Move transcription to archive"""
+    transcriptions = load_transcriptions()
+    archived = load_archived_transcriptions()
+    
+    # Find and move transcription
+    for i, trans in enumerate(transcriptions):
+        if trans.get('id') == transcription_id:
+            trans['archived_date'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            archived.append(trans)
+            transcriptions.pop(i)
+            break
+    
+    # Save both files
+    with open(TRANSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(transcriptions, f, indent=2, ensure_ascii=False)
+    with open(ARCHIVED_TRANSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(archived, f, indent=2, ensure_ascii=False)
+    return True
+
+def purge_transcription(transcription_id, from_archive=False):
+    """Permanently delete transcription"""
+    if from_archive:
+        archived = load_archived_transcriptions()
+        archived = [t for t in archived if t.get('id') != transcription_id]
+        with open(ARCHIVED_TRANSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(archived, f, indent=2, ensure_ascii=False)
+    else:
+        transcriptions = load_transcriptions()
+        transcriptions = [t for t in transcriptions if t.get('id') != transcription_id]
+        with open(TRANSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(transcriptions, f, indent=2, ensure_ascii=False)
+    return True
+
+def format_timestamp(seconds):
+    """Format seconds to HH:MM:SS.mmm or MM:SS.mmm"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+    return f"{minutes:02d}:{secs:02d}.{millis:03d}"
 
 # Configuration for large file processing
 CHUNK_SIZE_MB = 200  # Maximum chunk size in MB
@@ -1102,63 +1157,154 @@ with tab1:
 
 with tab2:
     st.header("📚 Stored Transcriptions")
-    st.markdown("View and download your previously completed transcriptions.")
     
-    transcriptions = load_transcriptions()
+    # Tabs for active and archived transcriptions
+    view_tab1, view_tab2 = st.tabs(["📋 Active", "📦 Archived"])
     
-    if not transcriptions:
-        st.info("📭 No stored transcriptions yet. Complete a transcription to see it here.")
-    else:
-        # Sort by date (newest first)
-        transcriptions.sort(key=lambda x: x.get("date", ""), reverse=True)
+    with view_tab1:
+        transcriptions = load_transcriptions()
         
-        st.metric("Total Transcriptions", len(transcriptions))
-        
-        # Search/filter
-        search_term = st.text_input("🔍 Search transcriptions", placeholder="Search by filename or date...")
-        
-        # Filter transcriptions
-        filtered_transcriptions = transcriptions
-        if search_term:
-            filtered_transcriptions = [
-                t for t in transcriptions
-                if search_term.lower() in t.get("filename", "").lower() 
-                or search_term.lower() in t.get("date", "").lower()
-                or search_term.lower() in t.get("text", "").lower()
-            ]
-        
-        if not filtered_transcriptions:
-            st.warning("No transcriptions found matching your search.")
+        if not transcriptions:
+            st.info("📭 No stored transcriptions yet. Complete a transcription to see it here.")
         else:
-            for idx, trans in enumerate(filtered_transcriptions):
-                with st.expander(
-                    f"📄 {trans.get('filename', 'Unknown')} - {trans.get('date', 'Unknown date')}",
-                    expanded=False
-                ):
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        st.write(f"**Language:** {trans.get('language', 'Unknown')}")
-                        st.write(f"**Duration:** {trans.get('duration', 0):.2f} seconds")
-                        st.write(f"**Segments:** {trans.get('segments_count', 0)}")
-                        st.write(f"**Model:** {trans.get('model', 'Unknown')}")
-                        st.write(f"**Task:** {trans.get('task', 'transcribe').capitalize()}")
-                    
-                    with col2:
-                        st.write(f"**Date:** {trans.get('date', 'Unknown')}")
-                        st.write(f"**ID:** {trans.get('id', 'Unknown')}")
-                    
-                    # Preview text
-                    text_preview = trans.get('text', '')[:500]  # First 500 chars
+            # Sort by date (newest first)
+            transcriptions.sort(key=lambda x: x.get("date", ""), reverse=True)
+            
+            col_metric, col_search = st.columns([1, 3])
+            with col_metric:
+                st.metric("Total Transcriptions", len(transcriptions))
+            with col_search:
+                search_term = st.text_input("🔍 Search transcriptions", placeholder="Search by filename or date...", key="search_active")
+            
+            # Filter transcriptions
+            filtered_transcriptions = transcriptions
+            if search_term:
+                filtered_transcriptions = [
+                    t for t in transcriptions
+                    if search_term.lower() in t.get("filename", "").lower() 
+                    or search_term.lower() in t.get("date", "").lower()
+                    or search_term.lower() in t.get("text", "").lower()
+                ]
+            
+            if not filtered_transcriptions:
+                st.warning("No transcriptions found matching your search.")
+            else:
+                for idx, trans in enumerate(filtered_transcriptions):
                     trans_id = trans.get('id', 'unknown')
-                    st.text_area(
-                        "Preview",
-                        value=text_preview + ("..." if len(trans.get('text', '')) > 500 else ""),
-                        height=100,
-                        disabled=True,
-                        label_visibility="collapsed",
-                        key=f"preview_text_area_{trans_id}"
-                    )
+                    
+                    # Transcription viewer with timestamp navigation
+                    with st.expander(
+                        f"📄 {trans.get('filename', 'Unknown')} - {trans.get('date', 'Unknown date')}",
+                        expanded=False
+                    ):
+                        # Metadata
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            st.write(f"**Language:** {trans.get('language', 'Unknown')}")
+                            st.write(f"**Duration:** {trans.get('duration', 0):.2f} seconds")
+                            st.write(f"**Segments:** {trans.get('segments_count', 0)}")
+                            st.write(f"**Model:** {trans.get('model', 'Unknown')}")
+                            st.write(f"**Task:** {trans.get('task', 'transcribe').capitalize()}")
+                        
+                        with col2:
+                            st.write(f"**Date:** {trans.get('date', 'Unknown')}")
+                            st.write(f"**ID:** {trans.get('id', 'Unknown')}")
+                        
+                        # Timestamp-based viewer
+                        full_result = trans.get('full_result', {})
+                        segments = full_result.get("segments", [])
+                        
+                        if segments:
+                            st.subheader("🎬 Transcription Viewer with Timestamps")
+                            
+                            # Initialize selectbox key in session state if not exists
+                            selectbox_key = f"segment_select_{trans_id}"
+                            if selectbox_key not in st.session_state:
+                                st.session_state[selectbox_key] = 0
+                            
+                            # Handle navigation button clicks
+                            nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
+                            with nav_col1:
+                                if st.button("⏮️ First", key=f"first_{trans_id}"):
+                                    st.session_state[selectbox_key] = 0
+                                    st.rerun()
+                            with nav_col2:
+                                if st.button("◀️ Previous", key=f"prev_{trans_id}"):
+                                    current_idx = st.session_state.get(selectbox_key, 0)
+                                    if current_idx > 0:
+                                        st.session_state[selectbox_key] = current_idx - 1
+                                        st.rerun()
+                            with nav_col3:
+                                if st.button("Next ▶️", key=f"next_{trans_id}"):
+                                    current_idx = st.session_state.get(selectbox_key, 0)
+                                    if current_idx < len(segments) - 1:
+                                        st.session_state[selectbox_key] = current_idx + 1
+                                        st.rerun()
+                            with nav_col4:
+                                if st.button("⏭️ Last", key=f"last_{trans_id}"):
+                                    st.session_state[selectbox_key] = len(segments) - 1
+                                    st.rerun()
+                            
+                            # Get current segment index from session state
+                            current_segment_idx = st.session_state.get(selectbox_key, 0)
+                            
+                            # Ensure index is within bounds
+                            if current_segment_idx >= len(segments):
+                                current_segment_idx = len(segments) - 1
+                                st.session_state[selectbox_key] = current_segment_idx
+                            if current_segment_idx < 0:
+                                current_segment_idx = 0
+                                st.session_state[selectbox_key] = 0
+                            
+                            # Segment navigation dropdown
+                            segment_options = [f"[{format_timestamp(s.get('start', 0))} → {format_timestamp(s.get('end', 0))}] {s.get('text', '')[:50]}..." 
+                                             for s in segments]
+                            
+                            # Selectbox maintains its own state via key
+                            selected_segment_idx = st.selectbox(
+                                "Navigate by timestamp:",
+                                range(len(segments)),
+                                index=current_segment_idx,
+                                format_func=lambda x: segment_options[x] if x < len(segment_options) else f"Segment {x+1}",
+                                key=selectbox_key
+                            )
+                            
+                            # Display selected segment
+                            if selected_segment_idx < len(segments):
+                                selected_segment = segments[selected_segment_idx]
+                                start_time = selected_segment.get('start', 0)
+                                end_time = selected_segment.get('end', 0)
+                                segment_text = selected_segment.get('text', '').strip()
+                                
+                                st.markdown(f"**Timestamp:** `{format_timestamp(start_time)}` → `{format_timestamp(end_time)}`")
+                                st.text_area(
+                                    "Segment Text",
+                                    value=segment_text,
+                                    height=100,
+                                    disabled=True,
+                                    key=f"segment_text_{trans_id}_{selected_segment_idx}"
+                                )
+                            
+                            # Full transcription view
+                            st.subheader("📝 Full Transcription")
+                            full_text = trans.get('text', '')
+                            st.text_area(
+                                "Complete Transcription",
+                                value=full_text,
+                                height=300,
+                                disabled=True,
+                                key=f"full_text_{trans_id}"
+                            )
+                        else:
+                            # Fallback if no segments
+                            st.text_area(
+                                "Transcription",
+                                value=trans.get('text', ''),
+                                height=200,
+                                disabled=True,
+                                key=f"text_{trans_id}"
+                            )
                     
                     # Download buttons
                     st.subheader("💾 Download")
@@ -1245,16 +1391,238 @@ with tab2:
                             )
                     
                     with dl_col4:
-                        # Delete button
-                        if st.button("🗑️ Delete", key=f"delete_{trans.get('id')}"):
-                            transcriptions.remove(trans)
-                            with open(TRANSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
-                                json.dump(transcriptions, f, indent=2, ensure_ascii=False)
-                            st.success("✅ Transcription deleted!")
-                            st.rerun()
+                        # Archive and Purge buttons
+                        action_col1, action_col2 = st.columns(2)
+                        with action_col1:
+                            if st.button("📦 Archive", key=f"archive_{trans.get('id')}", help="Move to archive"):
+                                archive_transcription(trans.get('id'))
+                                st.success("✅ Transcription archived!")
+                                st.rerun()
+                        with action_col2:
+                            if st.button("🗑️ Purge", key=f"purge_{trans.get('id')}", help="Permanently delete", type="secondary"):
+                                purge_transcription(trans.get('id'))
+                                st.success("✅ Transcription purged!")
+                                st.rerun()
                     
                     if idx < len(filtered_transcriptions) - 1:
                         st.divider()
+    
+    with view_tab2:
+        archived = load_archived_transcriptions()
+        
+        if not archived:
+            st.info("📦 No archived transcriptions yet.")
+        else:
+            # Sort by archived date (newest first)
+            archived.sort(key=lambda x: x.get("archived_date", ""), reverse=True)
+            
+            col_metric, col_search = st.columns([1, 3])
+            with col_metric:
+                st.metric("Archived Transcriptions", len(archived))
+            with col_search:
+                search_term = st.text_input("🔍 Search archived", placeholder="Search by filename or date...", key="search_archived")
+            
+            # Filter archived
+            filtered_archived = archived
+            if search_term:
+                filtered_archived = [
+                    t for t in archived
+                    if search_term.lower() in t.get("filename", "").lower() 
+                    or search_term.lower() in t.get("date", "").lower()
+                    or search_term.lower() in t.get("text", "").lower()
+                ]
+            
+            if not filtered_archived:
+                st.warning("No archived transcriptions found matching your search.")
+            else:
+                for idx, trans in enumerate(filtered_archived):
+                    trans_id = trans.get('id', 'unknown')
+                    
+                    with st.expander(
+                        f"📦 {trans.get('filename', 'Unknown')} - Archived: {trans.get('archived_date', 'Unknown date')}",
+                        expanded=False
+                    ):
+                        # Metadata
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            st.write(f"**Language:** {trans.get('language', 'Unknown')}")
+                            st.write(f"**Duration:** {trans.get('duration', 0):.2f} seconds")
+                            st.write(f"**Segments:** {trans.get('segments_count', 0)}")
+                            st.write(f"**Model:** {trans.get('model', 'Unknown')}")
+                            st.write(f"**Task:** {trans.get('task', 'transcribe').capitalize()}")
+                        
+                        with col2:
+                            st.write(f"**Original Date:** {trans.get('date', 'Unknown')}")
+                            st.write(f"**Archived Date:** {trans.get('archived_date', 'Unknown')}")
+                            st.write(f"**ID:** {trans.get('id', 'Unknown')}")
+                        
+                        # Timestamp-based viewer (same as active)
+                        full_result = trans.get('full_result', {})
+                        segments = full_result.get("segments", [])
+                        
+                        if segments:
+                            st.subheader("🎬 Transcription Viewer with Timestamps")
+                            
+                            # Initialize selectbox key in session state if not exists
+                            selectbox_key = f"archived_segment_select_{trans_id}"
+                            if selectbox_key not in st.session_state:
+                                st.session_state[selectbox_key] = 0
+                            
+                            # Handle navigation button clicks
+                            nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
+                            with nav_col1:
+                                if st.button("⏮️ First", key=f"archived_first_{trans_id}"):
+                                    st.session_state[selectbox_key] = 0
+                                    st.rerun()
+                            with nav_col2:
+                                if st.button("◀️ Previous", key=f"archived_prev_{trans_id}"):
+                                    current_idx = st.session_state.get(selectbox_key, 0)
+                                    if current_idx > 0:
+                                        st.session_state[selectbox_key] = current_idx - 1
+                                        st.rerun()
+                            with nav_col3:
+                                if st.button("Next ▶️", key=f"archived_next_{trans_id}"):
+                                    current_idx = st.session_state.get(selectbox_key, 0)
+                                    if current_idx < len(segments) - 1:
+                                        st.session_state[selectbox_key] = current_idx + 1
+                                        st.rerun()
+                            with nav_col4:
+                                if st.button("⏭️ Last", key=f"archived_last_{trans_id}"):
+                                    st.session_state[selectbox_key] = len(segments) - 1
+                                    st.rerun()
+                            
+                            # Get current segment index from session state
+                            current_segment_idx = st.session_state.get(selectbox_key, 0)
+                            
+                            # Ensure index is within bounds
+                            if current_segment_idx >= len(segments):
+                                current_segment_idx = len(segments) - 1
+                                st.session_state[selectbox_key] = current_segment_idx
+                            if current_segment_idx < 0:
+                                current_segment_idx = 0
+                                st.session_state[selectbox_key] = 0
+                            
+                            # Segment navigation dropdown
+                            segment_options = [f"[{format_timestamp(s.get('start', 0))} → {format_timestamp(s.get('end', 0))}] {s.get('text', '')[:50]}..." 
+                                             for s in segments]
+                            
+                            # Selectbox maintains its own state via key
+                            selected_segment_idx = st.selectbox(
+                                "Navigate by timestamp:",
+                                range(len(segments)),
+                                index=current_segment_idx,
+                                format_func=lambda x: segment_options[x] if x < len(segment_options) else f"Segment {x+1}",
+                                key=selectbox_key
+                            )
+                            
+                            # Display selected segment
+                            if selected_segment_idx < len(segments):
+                                selected_segment = segments[selected_segment_idx]
+                                start_time = selected_segment.get('start', 0)
+                                end_time = selected_segment.get('end', 0)
+                                segment_text = selected_segment.get('text', '').strip()
+                                
+                                st.markdown(f"**Timestamp:** `{format_timestamp(start_time)}` → `{format_timestamp(end_time)}`")
+                                st.text_area(
+                                    "Segment Text",
+                                    value=segment_text,
+                                    height=100,
+                                    disabled=True,
+                                    key=f"archived_segment_text_{trans_id}_{selected_segment_idx}"
+                                )
+                            
+                            # Full transcription view
+                            st.subheader("📝 Full Transcription")
+                            full_text = trans.get('text', '')
+                            st.text_area(
+                                "Complete Transcription",
+                                value=full_text,
+                                height=300,
+                                disabled=True,
+                                key=f"archived_full_text_{trans_id}"
+                            )
+                        else:
+                            st.text_area(
+                                "Transcription",
+                                value=trans.get('text', ''),
+                                height=200,
+                                disabled=True,
+                                key=f"archived_text_{trans_id}"
+                            )
+                        
+                        # Download buttons (same as active)
+                        st.subheader("💾 Download")
+                        dl_col1, dl_col2, dl_col3, dl_col4 = st.columns(4)
+                        
+                        with dl_col1:
+                            txt_content = ""
+                            if full_result.get("segments"):
+                                txt_content += f"Transcription: {trans.get('filename', 'Unknown')}\n"
+                                txt_content += f"Language: {trans.get('language', 'Unknown')}\n"
+                                txt_content += f"Duration: {trans.get('duration', 0):.2f} seconds\n"
+                                txt_content += f"Date: {trans.get('date', 'Unknown')}\n"
+                                txt_content += "=" * 50 + "\n\n"
+                                txt_content += "TRANSCRIPTION WITH TIMESTAMPS:\n"
+                                txt_content += "-" * 50 + "\n\n"
+                                for segment in full_result["segments"]:
+                                    start = segment.get('start', 0)
+                                    end = segment.get('end', 0)
+                                    text = segment.get('text', '').strip()
+                                    txt_content += f"[{format_timestamp(start)} --> {format_timestamp(end)}] {text}\n\n"
+                                txt_content += "\n" + "=" * 50 + "\n\n"
+                                txt_content += "PLAIN TEXT (NO TIMESTAMPS):\n"
+                                txt_content += "-" * 50 + "\n\n"
+                            txt_content += trans.get('text', '')
+                            
+                            st.download_button(
+                                label="📄 TXT",
+                                data=txt_content,
+                                file_name=f"{Path(trans.get('filename', 'transcription')).stem}_transcription.txt",
+                                mime="text/plain",
+                                key=f"archived_txt_{trans.get('id')}"
+                            )
+                        
+                        with dl_col2:
+                            docx_buffer = create_docx(
+                                trans.get('text', ''),
+                                trans.get('filename', 'transcription'),
+                                {
+                                    "filename": trans.get('filename', 'Unknown'),
+                                    "language": trans.get('language', 'Unknown'),
+                                    "duration": trans.get('duration', 0),
+                                    "date": trans.get('date', 'Unknown')
+                                },
+                                segments=full_result.get("segments")
+                            )
+                            st.download_button(
+                                label="📝 DOCX",
+                                data=docx_buffer.getvalue(),
+                                file_name=f"{Path(trans.get('filename', 'transcription')).stem}_transcription.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"archived_docx_{trans.get('id')}"
+                            )
+                        
+                        with dl_col3:
+                            if trans.get('full_result'):
+                                json_output = json.dumps(trans['full_result'], indent=2, ensure_ascii=False)
+                                st.download_button(
+                                    label="📊 JSON",
+                                    data=json_output,
+                                    file_name=f"{Path(trans.get('filename', 'transcription')).stem}_transcription.json",
+                                    mime="application/json",
+                                    key=f"archived_json_{trans.get('id')}"
+                                )
+                        
+                        with dl_col4:
+                            # Purge button for archived
+                            if st.button("🗑️ Purge", key=f"purge_archived_{trans.get('id')}", help="Permanently delete", type="secondary"):
+                                purge_transcription(trans.get('id'), from_archive=True)
+                                st.success("✅ Transcription purged!")
+                                st.rerun()
+                        
+                        if idx < len(filtered_archived) - 1:
+                            st.divider()
 
 # Footer
 st.markdown("---")
