@@ -5,16 +5,24 @@ import os
 import sys
 import io
 import json
+import re
+import shutil
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 # Check and install watchdog if needed (required for Streamlit file watching)
 try:
@@ -118,9 +126,96 @@ def format_timestamp(seconds):
 
 # Configuration for large file processing
 CHUNK_SIZE_MB = 200  # Maximum chunk size in MB
-MAX_WORKERS = 5  # Number of parallel threads
+DEFAULT_MAX_WORKERS = 7  # Default number of parallel threads
 CHUNK_DURATION_SECONDS = 300  # 5 minutes per chunk (reduced to create more chunks for better parallelization)
 MIN_CHUNK_DURATION_SECONDS = 60  # Minimum chunk duration (1 minute) to avoid too many tiny chunks
+
+def is_valid_url(url: str) -> bool:
+    """Basic validation for HTTP/HTTPS URLs."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def safe_filename(name: str) -> str:
+    """Create a filesystem-friendly name for downloads."""
+    if not name:
+        return "transcription"
+    sanitized = "".join(ch if ch.isalnum() or ch in (" ", "-", "_", ".") else "_" for ch in name)
+    sanitized = sanitized.strip().strip("._-")
+    return sanitized or "transcription"
+
+
+def download_audio_from_url(url: str, progress_callback=None):
+    """Download audio from a URL (e.g., YouTube) using yt-dlp."""
+    if yt_dlp is None:
+        raise ImportError("yt-dlp is required for URL downloads. Install it with 'pip install yt-dlp'.")
+    
+    temp_dir = tempfile.mkdtemp(prefix="whisper_url_")
+    output_template = os.path.join(temp_dir, "source.%(ext)s")
+    
+    def _hook(data):
+        if progress_callback:
+            try:
+                progress_callback(data)
+            except Exception:
+                # Avoid breaking download if UI update fails
+                pass
+    
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [_hook],
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(f"Failed to download audio: {exc}") from exc
+    
+    downloaded_path = None
+    requested_downloads = info.get("requested_downloads") or []
+    if requested_downloads:
+        downloaded_path = requested_downloads[0].get("filepath")
+    
+    if not downloaded_path:
+        downloaded_path = info.get("_filename")
+    
+    if not downloaded_path:
+        downloaded_path = output_template.replace("%(ext)s", info.get("ext", "mp3"))
+    
+    if not os.path.exists(downloaded_path):
+        alt_path = Path(downloaded_path).with_suffix(".mp3")
+        if alt_path.exists():
+            downloaded_path = str(alt_path)
+    
+    if not os.path.exists(downloaded_path):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise FileNotFoundError("Downloaded audio file could not be located.")
+    
+    return {
+        "path": downloaded_path,
+        "cleanup_dir": temp_dir,
+        "title": info.get("title") or info.get("id") or "downloaded_audio",
+        "duration": info.get("duration"),
+        "source_url": info.get("webpage_url", url),
+        "uploader": info.get("uploader"),
+    }
 
 def get_file_duration(file_path):
     """Get the duration of an audio/video file in seconds using ffprobe"""
@@ -187,7 +282,7 @@ def validate_chunk_file(chunk_path, min_duration=1.0):
     except:
         return False
 
-def split_file_into_chunks(file_path, chunk_duration=CHUNK_DURATION_SECONDS, max_workers=MAX_WORKERS):
+def split_file_into_chunks(file_path, chunk_duration=CHUNK_DURATION_SECONDS, max_workers=DEFAULT_MAX_WORKERS):
     """Split a large file into time-based chunks using ffmpeg
     
     Creates enough chunks to utilize the thread pool effectively.
@@ -367,8 +462,11 @@ def transcribe_chunk(chunk_info, model, transcribe_options, progress_callback=No
 
 def combine_chunk_results(chunk_results, chunks_info):
     """Combine transcription results from multiple chunks, maintaining temporal order"""
-    # Sort by chunk index to maintain order
-    chunk_results.sort(key=lambda x: x["chunk_index"])
+    # Sort by actual start time (with chunk index as a stable fallback)
+    ordered_chunk_results = sorted(
+        chunk_results,
+        key=lambda x: (x.get("start_time", 0), x.get("chunk_index", 0))
+    )
     
     all_segments = []
     all_text_parts = []
@@ -376,14 +474,8 @@ def combine_chunk_results(chunk_results, chunks_info):
     total_duration = 0
     processed_chunk_indices = set()
     
-    # Create a map of chunk indices to their time ranges
-    chunk_time_map = {chunk["index"]: (chunk["start_time"], chunk["end_time"]) for chunk in chunks_info}
-    
-    for chunk_result in chunk_results:
-        if not chunk_result["success"]:
-            # Track which chunks were skipped
-            chunk_idx = chunk_result["chunk_index"]
-            processed_chunk_indices.add(chunk_idx)
+    for chunk_result in ordered_chunk_results:
+        if not chunk_result.get("success"):
             continue
         
         chunk_idx = chunk_result["chunk_index"]
@@ -547,6 +639,15 @@ with st.sidebar:
         value=False,
         help="Extract timestamps for each word (slower but more detailed)"
     )
+    
+    max_workers_setting = st.slider(
+        "Parallel thread pool size",
+        min_value=1,
+        max_value=16,
+        value=DEFAULT_MAX_WORKERS,
+        help="Controls how many chunks are processed at once for large files. Lower this if your system overheats or struggles."
+    )
+    st.caption(f"Current pool size: {max_workers_setting} worker(s). Default is {DEFAULT_MAX_WORKERS}.")
 
 with tab1:
     # Note about large files
@@ -557,6 +658,12 @@ with tab1:
         "Upload Audio or Video File",
         type=["mp3", "wav", "flac", "m4a", "ogg", "wma", "aac", "mov", "mp4", "avi", "mkv", "webm", "m4v"],
         help="Supported formats: Audio (MP3, WAV, FLAC, M4A, OGG, WMA, AAC) and Video (MOV, MP4, AVI, MKV, WEBM, M4V). Large files (>200MB) will be automatically split into chunks and processed in parallel. Maximum upload size: 2GB (requires app restart if you see 200MB limit)."
+    )
+    
+    url_input = st.text_input(
+        "Or paste a YouTube URL",
+        placeholder="https://www.youtube.com/watch?v=...",
+        help="If provided, the app will download the audio using yt-dlp and transcribe it."
     )
 
     if uploaded_file is not None:
@@ -569,51 +676,107 @@ with tab1:
         
         st.info(f"📁 **{file_details['Filename']}** ({file_details['FileSize']})")
         
-        # Process button
-        if st.button("🚀 Transcribe Audio", type="primary", use_container_width=True):
+    # Process button
+    if st.button("🚀 Transcribe Audio", type="primary", use_container_width=True):
+        url_to_process = url_input.strip()
+        proceed_with_transcription = uploaded_file is not None or is_valid_url(url_to_process)
+        
+        if not proceed_with_transcription:
+            st.warning("Please upload a file or enter a valid YouTube URL before starting a transcription.")
+        else:
             # Create containers for progress updates
             progress_container = st.container()
             log_container = st.container()
+            source_mode = "upload" if uploaded_file is not None else "url"
+            source_filename = uploaded_file.name if uploaded_file is not None else None
+            source_size_bytes = uploaded_file.size if uploaded_file is not None else None
+            source_metadata = {}
+            tmp_file_path = None
+            download_cleanup_dir = None
+            source_stem = None
             
             try:
-                # Step 1: Save uploaded file
+                # Step 1: Acquire audio (upload or URL download)
                 with progress_container:
-                    st.toast("📁 Saving uploaded file...", icon="📁")
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_file_path = tmp_file.name
-                    st.toast("✅ File saved successfully", icon="✅")
-                
+                    if source_mode == "upload":
+                        st.toast("📁 Saving uploaded file...", icon="📁")
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_file_path = tmp_file.name
+                        source_size_bytes = os.path.getsize(tmp_file_path)
+                        st.toast("✅ File saved successfully", icon="✅")
+                    else:
+                        st.toast("🔗 Downloading audio from URL...", icon="🔗")
+                        download_progress = st.progress(0, text="Initializing download...")
+                        
+                        def download_hook(data):
+                            status = data.get("status")
+                            if status == "downloading":
+                                total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                                downloaded = data.get("downloaded_bytes", 0)
+                                pct = 0
+                                if total_bytes:
+                                    pct = min(0.9, downloaded / total_bytes)
+                                download_progress.progress(
+                                    int(pct * 100),
+                                    text=f"Downloading... {downloaded / (1024 * 1024):.1f} MB"
+                                )
+                            elif status == "finished":
+                                download_progress.progress(100, text="Download complete. Processing audio...")
+                        
+                        download_data = download_audio_from_url(url_to_process, progress_callback=download_hook)
+                        tmp_file_path = download_data["path"]
+                        download_cleanup_dir = download_data["cleanup_dir"]
+                        detected_title = download_data.get("title")
+                        if detected_title:
+                            source_filename = detected_title
+                        if not source_filename:
+                            source_filename = Path(tmp_file_path).name
+                        if Path(source_filename).suffix == "":
+                            source_filename = f"{source_filename}{Path(tmp_file_path).suffix}"
+                        source_metadata["source_url"] = download_data.get("source_url")
+                        source_metadata["uploader"] = download_data.get("uploader")
+                        source_metadata["downloaded_filename"] = Path(tmp_file_path).name
+                        source_size_bytes = os.path.getsize(tmp_file_path)
+                        st.toast("✅ Audio downloaded successfully", icon="✅")
+            
                 # Step 2: Load model
                 with progress_container:
                     st.toast("🔄 Loading model... This may take a moment on first use", icon="🔄")
                     progress_bar = st.progress(0, text="Loading model...")
                     status_text = st.empty()
-                    
+                
                     status_text.info("📦 Loading Whisper model (this may download the model on first use)...")
                     model = whisper.load_model(selected_model)
-                    
+                
                     progress_bar.progress(100, text="Model loaded!")
                     status_text.success("✅ Model loaded successfully!")
                     st.toast("✅ Model loaded!", icon="✅")
-                
+            
                 # Step 3: Prepare transcription options
                 transcribe_options = {
                     "task": task,
                     "word_timestamps": word_timestamps,
                     "verbose": True  # Enable verbose to get progress updates
                 }
-                
+            
                 if language != "Auto-detect":
                     transcribe_options["language"] = language
                     st.toast(f"🌍 Language set to: {language}", icon="🌍")
                 else:
                     st.toast("🔍 Auto-detecting language...", icon="🔍")
-                
+            
                 # Step 4: Check file size and decide on processing method
-                file_size_mb = uploaded_file.size / (1024 * 1024)
+                source_size_bytes = source_size_bytes or os.path.getsize(tmp_file_path)
+                file_size_mb = source_size_bytes / (1024 * 1024)
+                if source_mode == "url":
+                    info_message = f"🌐 **{source_filename}** ({file_size_mb:.2f} MB) downloaded from URL"
+                    if source_metadata.get("source_url"):
+                        info_message += f" ({source_metadata['source_url']})"
+                    st.info(info_message)
+                source_stem = safe_filename(Path(source_filename).stem or source_filename)
                 use_chunking = file_size_mb > CHUNK_SIZE_MB
-                
+            
                 if use_chunking:
                     # Large file: Use chunking and parallel processing
                     with progress_container:
@@ -621,20 +784,20 @@ with tab1:
                         transcription_progress = st.progress(0, text="Preparing chunks...")
                         transcription_status = st.empty()
                         transcription_status.info(f"📦 File is {file_size_mb:.2f} MB. Splitting into chunks for parallel processing...")
-                        
+                    
                         # Split file into chunks
-                        chunks, chunk_dir = split_file_into_chunks(tmp_file_path, max_workers=MAX_WORKERS)
+                        chunks, chunk_dir = split_file_into_chunks(tmp_file_path, max_workers=max_workers_setting)
                         num_chunks = len(chunks)
-                        
+                    
                         if num_chunks == 0:
                             raise ValueError("Failed to create valid chunks from the file. The file may be corrupted or contain no audio.")
-                        
+                    
                         # Calculate actual thread usage (min of workers and chunks)
-                        actual_threads = min(MAX_WORKERS, num_chunks)
-                        
+                        actual_threads = min(max_workers_setting, num_chunks)
+                    
                         transcription_progress.progress(10, text=f"Created {num_chunks} valid chunks. Starting parallel transcription...")
-                        transcription_status.info(f"🔄 Processing {num_chunks} chunks in parallel using {actual_threads} threads (pool size: {MAX_WORKERS})...")
-                        
+                        transcription_status.info(f"🔄 Processing {num_chunks} chunks in parallel using {actual_threads} threads (pool size: {max_workers_setting})...")
+                    
                         # Show chunk coverage info
                         if chunks:
                             total_chunk_duration = sum(chunk.get("duration", 0) for chunk in chunks)
@@ -642,40 +805,40 @@ with tab1:
                             if file_duration:
                                 coverage_pct = (total_chunk_duration / file_duration) * 100
                                 st.info(f"📊 Chunk coverage: {total_chunk_duration:.1f}s / {file_duration:.1f}s ({coverage_pct:.1f}%) - All chunks will be processed and reconstituted")
-                        
+                    
                         # Create individual progress indicators for each chunk
                         chunk_progress_container = st.container()
                         with chunk_progress_container:
                             st.subheader("📊 Individual Chunk Progress")
                             chunk_progress_bars = {}
                             chunk_status_texts = {}
-                            
+                        
                             # Initialize progress bars for each chunk
                             for chunk in chunks:
                                 chunk_idx = chunk["index"]
                                 chunk_key = f"chunk_{chunk_idx}"
-                                
+                            
                                 col1, col2 = st.columns([1, 4])
                                 with col1:
                                     st.write(f"**Chunk {chunk_idx + 1}**")
                                     st.caption(f"{chunk['start_time']:.1f}s - {chunk['end_time']:.1f}s")
-                                
+                            
                                 with col2:
                                     chunk_progress_bars[chunk_key] = st.progress(0, text="Waiting to start...")
                                     chunk_status_texts[chunk_key] = st.empty()
                                     chunk_status_texts[chunk_key].info("⏳ Queued for processing...")
-                        
+                    
                         # Process chunks in parallel
                         chunk_results = []
                         completed_chunks = 0
                         successful_chunks = 0
                         failed_chunks = []
-                        
+                    
                         # Thread-safe progress tracking and model access
                         progress_lock = threading.Lock()
                         model_lock = threading.Lock()  # Lock for model access (Whisper models are not thread-safe)
                         progress_updates = {}  # Store progress updates to apply in main thread
-                        
+                    
                         def update_chunk_progress(chunk_idx, status, progress_pct=0):
                             """Update progress for a specific chunk (thread-safe)"""
                             chunk_key = f"chunk_{chunk_idx}"
@@ -685,7 +848,7 @@ with tab1:
                                     "progress": progress_pct,
                                     "message": f"🔄 {status}"
                                 }
-                        
+                    
                         def transcribe_chunk_with_progress(chunk_info, model, transcribe_options):
                             """Transcribe chunk with progress updates"""
                             chunk_idx = chunk_info["index"]
@@ -694,14 +857,14 @@ with tab1:
                             try:
                                 update_chunk_progress(chunk_idx, "Starting transcription...", 10)
                                 
-                                # Validate chunk first
+                                # Validate chunk location and size
                                 if not os.path.exists(chunk_info["path"]):
                                     update_chunk_progress(chunk_idx, "❌ File not found", 0)
                                     return {
                                         "chunk_index": chunk_idx,
                                         "start_time": chunk_info["start_time"],
                                         "error": "Chunk file does not exist",
-                                        "success": False
+                                        "success": False,
                                     }
                                 
                                 file_size = os.path.getsize(chunk_info["path"])
@@ -711,12 +874,12 @@ with tab1:
                                         "chunk_index": chunk_idx,
                                         "start_time": chunk_info["start_time"],
                                         "error": "Chunk file is too small (likely empty)",
-                                        "success": False
+                                        "success": False,
                                     }
                                 
                                 update_chunk_progress(chunk_idx, "Loading audio...", 20)
                                 
-                                # Load and validate audio
+                                # Load and validate audio data
                                 try:
                                     audio = whisper.load_audio(chunk_info["path"])
                                     if len(audio) == 0 or audio.size == 0:
@@ -725,28 +888,25 @@ with tab1:
                                             "chunk_index": chunk_idx,
                                             "start_time": chunk_info["start_time"],
                                             "error": "Chunk contains no audio data",
-                                            "success": False
+                                            "success": False,
                                         }
-                                except Exception as e:
-                                    update_chunk_progress(chunk_idx, f"❌ Audio load failed: {str(e)[:50]}", 0)
+                                except Exception as audio_error:
+                                    update_chunk_progress(chunk_idx, f"❌ Audio load failed: {str(audio_error)[:50]}", 0)
                                     return {
                                         "chunk_index": chunk_idx,
                                         "start_time": chunk_info["start_time"],
-                                        "error": f"Failed to load audio: {str(e)}",
-                                        "success": False
+                                        "error": f"Failed to load audio: {audio_error}",
+                                        "success": False,
                                     }
                                 
                                 update_chunk_progress(chunk_idx, "Transcribing...", 40)
                                 
-                                # Transcribe with progress tracking and better error handling
-                                # Use model lock to ensure thread-safe access (Whisper models are not thread-safe)
+                                # Run Whisper on the chunk (models are not thread-safe)
                                 try:
                                     with model_lock:
                                         result = model.transcribe(chunk_info["path"], **transcribe_options)
                                 except Exception as transcribe_error:
-                                    # Catch transcription errors and provide better error messages
                                     error_msg = str(transcribe_error)
-                                    # Filter out model internals from error messages
                                     if "Linear(" in error_msg or "in_features" in error_msg:
                                         error_msg = "Model error during transcription (possibly corrupted audio or model issue)"
                                     elif "CUDA" in error_msg or "cuda" in error_msg:
@@ -754,15 +914,14 @@ with tab1:
                                     elif "out of memory" in error_msg.lower():
                                         error_msg = "Out of memory during transcription"
                                     else:
-                                        # Keep original error but truncate if too long
                                         error_msg = error_msg[:200] if len(error_msg) > 200 else error_msg
                                     
-                                    update_chunk_progress(chunk_idx, f"❌ Transcription failed", 0)
+                                    update_chunk_progress(chunk_idx, "❌ Transcription failed", 0)
                                     return {
                                         "chunk_index": chunk_idx,
                                         "start_time": chunk_info["start_time"],
                                         "error": error_msg,
-                                        "success": False
+                                        "success": False,
                                     }
                                 
                                 update_chunk_progress(chunk_idx, "Processing segments...", 80)
@@ -777,7 +936,7 @@ with tab1:
                                                 word["start"] += chunk_info["start_time"]
                                                 word["end"] += chunk_info["start_time"]
                                 
-                                num_segments = len(result.get('segments', []))
+                                num_segments = len(result.get("segments", []))
                                 update_chunk_progress(chunk_idx, f"✅ Complete ({num_segments} segments)", 100)
                                 
                                 return {
@@ -785,7 +944,7 @@ with tab1:
                                     "start_time": chunk_info["start_time"],
                                     "result": result,
                                     "success": True,
-                                    "num_segments": num_segments
+                                    "num_segments": num_segments,
                                 }
                             except Exception as e:
                                 error_msg = str(e)
@@ -796,121 +955,120 @@ with tab1:
                                     "chunk_index": chunk_idx,
                                     "start_time": chunk_info["start_time"],
                                     "error": error_msg,
-                                    "success": False
+                                    "success": False,
                                 }
+                    
+                    with ThreadPoolExecutor(max_workers=max_workers_setting) as executor:
+                        # Submit all chunks with progress tracking
+                        future_to_chunk = {
+                            executor.submit(transcribe_chunk_with_progress, chunk, model, transcribe_options): chunk
+                            for chunk in chunks
+                        }
                         
-                        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                            # Submit all chunks with progress tracking
-                            future_to_chunk = {
-                                executor.submit(transcribe_chunk_with_progress, chunk, model, transcribe_options): chunk
-                                for chunk in chunks
-                            }
+                        # Process completed chunks as they finish and update UI
+                        for future in as_completed(future_to_chunk):
+                            # Apply any pending progress updates
+                            with progress_lock:
+                                for chunk_key, update_info in progress_updates.items():
+                                    if chunk_key in chunk_progress_bars:
+                                        chunk_progress_bars[chunk_key].progress(
+                                            update_info["progress"] / 100, 
+                                            text=update_info["status"]
+                                        )
+                                        chunk_status_texts[chunk_key].info(update_info["message"])
+                                progress_updates.clear()
                             
-                            # Process completed chunks as they finish and update UI
-                            for future in as_completed(future_to_chunk):
-                                # Apply any pending progress updates
-                                with progress_lock:
-                                    for chunk_key, update_info in progress_updates.items():
-                                        if chunk_key in chunk_progress_bars:
-                                            chunk_progress_bars[chunk_key].progress(
-                                                update_info["progress"] / 100, 
-                                                text=update_info["status"]
-                                            )
-                                            chunk_status_texts[chunk_key].info(update_info["message"])
-                                    progress_updates.clear()
-                                
-                                chunk_result = future.result()
-                                chunk_results.append(chunk_result)
-                                completed_chunks += 1
-                                
-                                chunk_idx = chunk_result["chunk_index"]
-                                chunk_key = f"chunk_{chunk_idx}"
-                                
-                                if chunk_result["success"]:
-                                    successful_chunks += 1
-                                    num_segments = chunk_result.get("num_segments", 0)
-                                    chunk_progress_bars[chunk_key].progress(100, text=f"✅ Complete ({num_segments} segments)")
-                                    chunk_status_texts[chunk_key].success(f"✅ Completed: {num_segments} segments")
-                                    st.toast(f"✅ Chunk {chunk_idx + 1}/{num_chunks} completed", icon="✅")
-                                else:
-                                    failed_chunks.append({
-                                        "index": chunk_idx + 1,
-                                        "error": chunk_result.get('error', 'Unknown error')
-                                    })
-                                    chunk_progress_bars[chunk_key].progress(0, text=f"❌ Failed")
-                                    chunk_status_texts[chunk_key].error(f"❌ Failed: {chunk_result.get('error', 'Unknown error')[:100]}")
-                                    # Don't show warning for empty chunks (expected for silent segments)
-                                    if "empty" not in chunk_result.get('error', '').lower() and "no audio" not in chunk_result.get('error', '').lower():
-                                        st.warning(f"⚠️ Chunk {chunk_idx + 1} skipped: {chunk_result.get('error', 'Unknown error')}")
-                                
-                                # Update overall progress
-                                progress_pct = 10 + int((completed_chunks / num_chunks) * 85)
-                                transcription_progress.progress(
-                                    progress_pct / 100,
-                                    text=f"Processing chunks... {completed_chunks}/{num_chunks} completed ({successful_chunks} successful)"
-                                )
-                        
-                        # Check if we have any successful chunks
-                        if successful_chunks == 0:
-                            raise ValueError(f"All {num_chunks} chunks failed to transcribe. Please check the file format and try again.")
-                        
-                        # Calculate success rate
-                        success_rate = (successful_chunks / num_chunks) * 100
-                        
-                        # Show summary of failed chunks if any
-                        if failed_chunks:
-                            failed_summary = "\n".join([f"  - Chunk {f['index']}: {f['error']}" for f in failed_chunks])
+                            chunk_result = future.result()
+                            chunk_results.append(chunk_result)
+                            completed_chunks += 1
                             
-                            # Determine severity based on success rate
-                            if success_rate < 50:
-                                # Less than 50% success - this is a problem
-                                transcription_status.error(f"❌ **WARNING**: Only {successful_chunks}/{num_chunks} chunks succeeded ({success_rate:.1f}% success rate). Transcription may be incomplete!\n\n**Failed chunks:**\n{failed_summary}\n\n**Recommendation**: Check the file for corruption or try a different model size.")
-                            elif success_rate < 80:
-                                # 50-80% success - partial success
-                                transcription_status.warning(f"⚠️ **Partial Success**: {successful_chunks}/{num_chunks} chunks succeeded ({success_rate:.1f}% success rate). Some content may be missing.\n\n**Failed chunks:**\n{failed_summary}\n\nContinuing with {successful_chunks} successful chunk(s)...")
+                            chunk_idx = chunk_result["chunk_index"]
+                            chunk_key = f"chunk_{chunk_idx}"
+                            
+                            if chunk_result["success"]:
+                                successful_chunks += 1
+                                num_segments = chunk_result.get("num_segments", 0)
+                                chunk_progress_bars[chunk_key].progress(100, text=f"✅ Complete ({num_segments} segments)")
+                                chunk_status_texts[chunk_key].success(f"✅ Completed: {num_segments} segments")
+                                st.toast(f"✅ Chunk {chunk_idx + 1}/{num_chunks} completed", icon="✅")
                             else:
-                                # 80%+ success - mostly successful
-                                transcription_status.warning(f"⚠️ {len(failed_chunks)} chunk(s) failed:\n{failed_summary}\n\nContinuing with {successful_chunks} successful chunk(s)...")
+                                failed_chunks.append({
+                                    "index": chunk_idx + 1,
+                                    "error": chunk_result.get('error', 'Unknown error')
+                                })
+                                chunk_progress_bars[chunk_key].progress(0, text=f"❌ Failed")
+                                chunk_status_texts[chunk_key].error(f"❌ Failed: {chunk_result.get('error', 'Unknown error')[:100]}")
+                                # Don't show warning for empty chunks (expected for silent segments)
+                                if "empty" not in chunk_result.get('error', '').lower() and "no audio" not in chunk_result.get('error', '').lower():
+                                    st.warning(f"⚠️ Chunk {chunk_idx + 1} skipped: {chunk_result.get('error', 'Unknown error')}")
+                            
+                            # Update overall progress
+                            progress_pct = 10 + int((completed_chunks / num_chunks) * 85)
+                            transcription_progress.progress(
+                                progress_pct / 100,
+                                text=f"Processing chunks... {completed_chunks}/{num_chunks} completed ({successful_chunks} successful)"
+                            )
+                    
+                    # Check if we have any successful chunks
+                    if successful_chunks == 0:
+                        raise ValueError(f"All {num_chunks} chunks failed to transcribe. Please check the file format and try again.")
+                    
+                    # Calculate success rate
+                    success_rate = (successful_chunks / num_chunks) * 100
+                    
+                    # Show summary of failed chunks if any
+                    if failed_chunks:
+                        failed_summary = "\n".join([f"  - Chunk {f['index']}: {f['error']}" for f in failed_chunks])
                         
-                        # Combine results
-                        transcription_progress.progress(95, text="Combining results...")
-                        transcription_status.info(f"🔗 Combining transcription results from {successful_chunks} successful chunk(s)...")
-                        result = combine_chunk_results(chunk_results, chunks)
-                        
-                        # Verify completeness
-                        if result.get("_metadata"):
-                            missing = result["_metadata"].get("missing_chunks", [])
-                            if missing:
-                                st.warning(f"⚠️ Note: {len(missing)} chunk(s) were skipped: {missing}")
-                        
-                        # Show summary with success rate
-                        total_segments = len(result.get("segments", []))
-                        total_text_length = len(result.get("text", ""))
-                        
-                        # Determine final status based on success rate
-                        if success_rate >= 80:
-                            transcription_status.success(f"✅ **Transcription completed!** {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters")
-                        elif success_rate >= 50:
-                            transcription_status.warning(f"⚠️ **Partial transcription completed.** {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters. Some content may be missing.")
+                        # Determine severity based on success rate
+                        if success_rate < 50:
+                            # Less than 50% success - this is a problem
+                            transcription_status.error(f"❌ **WARNING**: Only {successful_chunks}/{num_chunks} chunks succeeded ({success_rate:.1f}% success rate). Transcription may be incomplete!\n\n**Failed chunks:**\n{failed_summary}\n\n**Recommendation**: Check the file for corruption or try a different model size.")
+                        elif success_rate < 80:
+                            # 50-80% success - partial success
+                            transcription_status.warning(f"⚠️ **Partial Success**: {successful_chunks}/{num_chunks} chunks succeeded ({success_rate:.1f}% success rate). Some content may be missing.\n\n**Failed chunks:**\n{failed_summary}\n\nContinuing with {successful_chunks} successful chunk(s)...")
                         else:
-                            transcription_status.error(f"❌ **Incomplete transcription.** Only {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters. Significant content may be missing.")
-                        
+                            # 80%+ success - mostly successful
+                            transcription_status.warning(f"⚠️ {len(failed_chunks)} chunk(s) failed:\n{failed_summary}\n\nContinuing with {successful_chunks} successful chunk(s)...")
+                    
+                    # Combine results
+                    transcription_progress.progress(95, text="Combining results...")
+                    transcription_status.info(f"🔗 Combining transcription results from {successful_chunks} successful chunk(s)...")
+                    result = combine_chunk_results(chunk_results, chunks)
+                    
+                    # Verify completeness
+                    if result.get("_metadata"):
+                        missing = result["_metadata"].get("missing_chunks", [])
+                        if missing:
+                            st.warning(f"⚠️ Note: {len(missing)} chunk(s) were skipped: {missing}")
+                    
+                    # Show summary with success rate
+                    total_segments = len(result.get("segments", []))
+                    total_text_length = len(result.get("text", ""))
+                    
+                    # Determine final status based on success rate
+                    if success_rate >= 80:
+                        transcription_status.success(f"✅ **Transcription completed!** {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters")
+                    elif success_rate >= 50:
+                        transcription_status.warning(f"⚠️ **Partial transcription completed.** {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters. Some content may be missing.")
+                    else:
+                        transcription_status.error(f"❌ **Incomplete transcription.** Only {successful_chunks}/{num_chunks} chunks processed ({success_rate:.1f}% success), {total_segments} segments, {total_text_length:,} characters. Significant content may be missing.")
+                    
                         # Clean up chunk files
-                        import shutil
                         try:
                             shutil.rmtree(chunk_dir)
                         except:
                             pass
-                        
-                        transcription_progress.progress(100, text="Transcription complete!")
-                        
-                        # Final toast message based on success rate
-                        if success_rate >= 80:
-                            st.toast("✅ Transcription completed successfully!", icon="✅")
-                        elif success_rate >= 50:
-                            st.toast("⚠️ Partial transcription completed - some chunks failed", icon="⚠️")
-                        else:
-                            st.toast("❌ Incomplete transcription - many chunks failed", icon="❌")
+                    
+                    transcription_progress.progress(100, text="Transcription complete!")
+                    
+                    # Final toast message based on success rate
+                    if success_rate >= 80:
+                        st.toast("✅ Transcription completed successfully!", icon="✅")
+                    elif success_rate >= 50:
+                        st.toast("⚠️ Partial transcription completed - some chunks failed", icon="⚠️")
+                    else:
+                        st.toast("❌ Incomplete transcription - many chunks failed", icon="❌")
                 else:
                     # Small file: Use standard processing
                     with progress_container:
@@ -918,25 +1076,25 @@ with tab1:
                         transcription_progress = st.progress(0, text="Initializing transcription...")
                         transcription_status = st.empty()
                         transcription_status.info("🎤 Transcribing audio... This may take a while depending on file size.")
-                        
+                    
                         # Create a collapsible log section
                         with st.expander("📋 View Transcription Logs (Real-time Progress)", expanded=True):
                             log_placeholder = st.empty()
                             log_output = []
-                            
+                        
                             # Capture stdout to show transcription progress
                             class ProgressCapture:
                                 def __init__(self):
                                     self.lines = []
                                     self.placeholder = log_placeholder
                                     self.segment_count = 0
-                                
+                            
                                 def write(self, text):
                                     if text.strip():
                                         # Parse segment lines (format: [00:00.000 --> 00:11.000] text)
                                         line = text.strip()
                                         self.lines.append(line)
-                                        
+                                    
                                         # Count segments
                                         if "-->" in line and "]" in line:
                                             self.segment_count += 1
@@ -946,36 +1104,35 @@ with tab1:
                                                 estimated_progress / 100, 
                                                 text=f"Transcribing... ({self.segment_count} segments processed)"
                                             )
-                                        
+                                    
                                         # Update log display (show last 15 lines)
                                         display_lines = self.lines[-15:]
                                         self.placeholder.code("\n".join(display_lines), language="text")
-                                
+                            
                                 def flush(self):
                                     pass
-                            
+                        
                             progress_capture = ProgressCapture()
-                            
+                        
                             # Transcribe with verbose output captured
                             with redirect_stdout(progress_capture):
                                 with redirect_stderr(progress_capture):
                                     result = model.transcribe(tmp_file_path, **transcribe_options)
-                            
+                        
                             # Final log update
                             if progress_capture.lines:
                                 log_placeholder.code("\n".join(progress_capture.lines[-20:]), language="text")
-                    
+                
                         transcription_progress.progress(100, text="Transcription complete!")
                         transcription_status.success(f"✅ Transcription completed! Processed {len(result.get('segments', []))} segments.")
                         st.toast("✅ Transcription complete!", icon="✅")
-                
-                # Step 5: Clean up
-                os.unlink(tmp_file_path)
-                
+            
+                    # Step 5: Clean up handled after try/except
+            
                 # Step 6: Save transcription to storage
                 transcription_metadata = {
                     "id": str(int(time.time())),
-                    "filename": uploaded_file.name,
+                    "filename": source_filename,
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "language": result.get("language", "Unknown"),
                     "duration": result.get("duration", 0),
@@ -983,15 +1140,19 @@ with tab1:
                     "model": selected_model,
                     "task": task,
                     "text": result["text"],
-                    "full_result": result  # Store full result for JSON download
+                    "full_result": result,  # Store full result for JSON download
+                    "source_type": source_mode,
                 }
+                for key, value in source_metadata.items():
+                    if value:
+                        transcription_metadata[key] = value
                 save_transcription(transcription_metadata)
                 st.toast("💾 Transcription saved to storage", icon="💾")
-                
+            
                 # Display results
                 st.balloons()  # Celebration animation
                 st.success("🎉 Transcription completed successfully!")
-                
+            
                 # Main transcription text
                 st.subheader("📝 Transcription")
                 st.text_area(
@@ -1001,29 +1162,29 @@ with tab1:
                     label_visibility="collapsed",
                     key="main_transcription_text_area"
                 )
-                
+            
                 # Additional information
                 with st.expander("ℹ️ Additional Information"):
                     col1, col2 = st.columns(2)
-                    
+                
                     with col1:
                         st.metric("Detected Language", result.get("language", "N/A"))
                         st.metric("Duration", f"{result.get('duration', 0):.2f} seconds")
-                    
+                
                     with col2:
                         st.metric("Segments", len(result.get("segments", [])))
                         if result.get("language"):
                             # Get language probability if available
                             st.metric("Task", task.capitalize())
-                
+            
                 # Segments with timestamps
                 if result.get("segments"):
                     st.subheader("⏱️ Segments with Timestamps")
-                    
+                
                     for i, segment in enumerate(result["segments"]):
                         start_time = segment.get("start", 0)
                         end_time = segment.get("end", 0)
-                        
+                    
                         # Format time
                         def format_time(seconds):
                             hours = int(seconds // 3600)
@@ -1032,35 +1193,35 @@ with tab1:
                             if hours > 0:
                                 return f"{hours:02d}:{minutes:02d}:{secs:02d}"
                             return f"{minutes:02d}:{secs:02d}"
-                        
+                    
                         st.markdown(f"**{format_time(start_time)} → {format_time(end_time)}**")
                         st.write(segment.get("text", ""))
-                        
+                    
                         if word_timestamps and segment.get("words"):
                             st.caption("Words: " + " | ".join([
                                 f"{w.get('word', '')} ({w.get('start', 0):.2f}s)"
                                 for w in segment.get("words", [])[:10]  # Show first 10 words
                             ]))
-                        
+                    
                         if i < len(result["segments"]) - 1:
                             st.divider()
-                
+            
                 # Download options
                 st.subheader("💾 Download Results")
-                
+            
                 col1, col2, col3, col4 = st.columns(4)
-                
+            
                 with col1:
                     # Create TXT with timestamps
                     txt_content = ""
                     if result.get("segments"):
                         # Add header
-                        txt_content += f"Transcription: {uploaded_file.name}\n"
+                        txt_content += f"Transcription: {source_filename}\n"
                         txt_content += f"Language: {result.get('language', 'Unknown')}\n"
                         txt_content += f"Duration: {result.get('duration', 0):.2f} seconds\n"
                         txt_content += f"Date: {transcription_metadata['date']}\n"
                         txt_content += "=" * 50 + "\n\n"
-                        
+                    
                         # Add segments with timestamps
                         txt_content += "TRANSCRIPTION WITH TIMESTAMPS:\n"
                         txt_content += "-" * 50 + "\n\n"
@@ -1068,7 +1229,7 @@ with tab1:
                             start = segment.get('start', 0)
                             end = segment.get('end', 0)
                             text = segment.get('text', '').strip()
-                            
+                        
                             # Format timestamp
                             def format_time(seconds):
                                 hours = int(seconds // 3600)
@@ -1078,30 +1239,30 @@ with tab1:
                                 if hours > 0:
                                     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
                                 return f"{minutes:02d}:{secs:02d}.{millis:03d}"
-                            
-                            txt_content += f"[{format_time(start)} --> {format_time(end)}] {text}\n\n"
                         
+                            txt_content += f"[{format_time(start)} --> {format_time(end)}] {text}\n\n"
+                    
                         txt_content += "\n" + "=" * 50 + "\n\n"
                         txt_content += "PLAIN TEXT (NO TIMESTAMPS):\n"
                         txt_content += "-" * 50 + "\n\n"
-                    
+                
                     # Add plain text
                     txt_content += result["text"]
-                    
+                
                     st.download_button(
                         label="📄 Download as TXT",
                         data=txt_content,
-                        file_name=f"{Path(uploaded_file.name).stem}_transcription.txt",
+                        file_name=f"{source_stem}_transcription.txt",
                         mime="text/plain"
                     )
-                
+            
                 with col2:
                     # Create DOCX file with timestamps
                     docx_buffer = create_docx(
                         result["text"],
-                        uploaded_file.name,
+                        source_filename,
                         {
-                            "filename": uploaded_file.name,
+                            "filename": source_filename,
                             "language": result.get("language", "Unknown"),
                             "duration": result.get("duration", 0),
                             "date": transcription_metadata["date"]
@@ -1111,20 +1272,20 @@ with tab1:
                     st.download_button(
                         label="📝 Download as DOCX",
                         data=docx_buffer.getvalue(),
-                        file_name=f"{Path(uploaded_file.name).stem}_transcription.docx",
+                        file_name=f"{source_stem}_transcription.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     )
-                
+            
                 with col3:
                     # Create JSON output
                     json_output = json.dumps(result, indent=2, ensure_ascii=False)
                     st.download_button(
                         label="📊 Download as JSON",
                         data=json_output,
-                        file_name=f"{Path(uploaded_file.name).stem}_transcription.json",
+                        file_name=f"{source_stem}_transcription.json",
                         mime="application/json"
                     )
-                
+            
                 with col4:
                     # Create SRT subtitle format
                     if result.get("segments"):
@@ -1132,28 +1293,36 @@ with tab1:
                         for i, segment in enumerate(result["segments"], 1):
                             start = segment.get("start", 0)
                             end = segment.get("end", 0)
-                            
+                        
                             def format_srt_time(seconds):
                                 hours = int(seconds // 3600)
                                 minutes = int((seconds % 3600) // 60)
                                 secs = int(seconds % 60)
                                 millis = int((seconds % 1) * 1000)
                                 return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-                            
+                        
                             srt_content += f"{i}\n"
                             srt_content += f"{format_srt_time(start)} --> {format_srt_time(end)}\n"
                             srt_content += f"{segment.get('text', '')}\n\n"
-                        
+                    
                         st.download_button(
                             label="📺 Download as SRT",
                             data=srt_content,
-                            file_name=f"{Path(uploaded_file.name).stem}_subtitles.srt",
+                            file_name=f"{source_stem}_subtitles.srt",
                             mime="text/plain"
                         )
-            
+        
             except Exception as e:
                 st.error(f"❌ Error during transcription: {str(e)}")
                 st.exception(e)
+            finally:
+                if tmp_file_path and os.path.exists(tmp_file_path):
+                    try:
+                        os.unlink(tmp_file_path)
+                    except OSError:
+                        pass
+                if download_cleanup_dir:
+                    shutil.rmtree(download_cleanup_dir, ignore_errors=True)
 
 with tab2:
     st.header("📚 Stored Transcriptions")
@@ -1210,6 +1379,8 @@ with tab2:
                         with col2:
                             st.write(f"**Date:** {trans.get('date', 'Unknown')}")
                             st.write(f"**ID:** {trans.get('id', 'Unknown')}")
+                            if trans.get('source_type') == "url" and trans.get('source_url'):
+                                st.write(f"**Source URL:** {trans.get('source_url')}")
                         
                         # Timestamp-based viewer
                         full_result = trans.get('full_result', {})
@@ -1456,6 +1627,8 @@ with tab2:
                             st.write(f"**Original Date:** {trans.get('date', 'Unknown')}")
                             st.write(f"**Archived Date:** {trans.get('archived_date', 'Unknown')}")
                             st.write(f"**ID:** {trans.get('id', 'Unknown')}")
+                            if trans.get('source_type') == "url" and trans.get('source_url'):
+                                st.write(f"**Source URL:** {trans.get('source_url')}")
                         
                         # Timestamp-based viewer (same as active)
                         full_result = trans.get('full_result', {})

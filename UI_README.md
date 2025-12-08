@@ -22,6 +22,7 @@ A simple web interface for transcribing audio files using OpenAI Whisper.
 ## Features
 
 - 📤 **Upload audio files** (MP3, WAV, FLAC, M4A, OGG, WMA, AAC)
+- 🌐 **Paste a YouTube URL** to auto-download and transcribe with yt-dlp
 - 🎯 **Select model** (tiny, base, small, medium, large, turbo)
 - 🌍 **Language detection** or manual language selection
 - 🔄 **Transcribe or Translate** to English
